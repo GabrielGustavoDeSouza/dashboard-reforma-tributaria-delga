@@ -48,6 +48,28 @@ st.markdown(f"<h1 style='color:{NAVY_DARK};'>Reforma Tributária <span style='co
 st.caption("Dashboard gerado a partir do arquivo MS Project (.mpp) — leitura direta, sem etapa manual de exportação.")
 
 # ---------------------------------------------------------------------------
+# ACESSO POR SENHA
+# ---------------------------------------------------------------------------
+APP_PASSWORD = "@DelgaRef2030"
+
+if "authenticated" not in st.session_state:
+    st.session_state["authenticated"] = False
+
+if not st.session_state["authenticated"]:
+    st.markdown(f"<h2 style='color:{NAVY_DARK};'>Acesso restrito</h2>", unsafe_allow_html=True)
+    st.caption("Digite a senha de acesso ao dashboard do Comitê da Reforma Tributária.")
+    with st.form("login_form"):
+        pwd = st.text_input("Senha", type="password")
+        entrar = st.form_submit_button("Entrar", type="primary")
+    if entrar:
+        if pwd == APP_PASSWORD:
+            st.session_state["authenticated"] = True
+            st.rerun()
+        else:
+            st.error("Senha incorreta.")
+    st.stop()
+
+# ---------------------------------------------------------------------------
 # JVM / MPXJ INIT (uma vez por processo)
 # ---------------------------------------------------------------------------
 @st.cache_resource(show_spinner=False)
@@ -219,15 +241,27 @@ progresso_total = tracked["real_pct"].mean() if len(tracked) else 0.0
 planned_total = tracked["planned_pct"].mean() if len(tracked) else 0.0
 spi = (progresso_total / planned_total * 100) if planned_total > 0 else None
 
-# marco critico: proxima entrega da etapa "0. Marcos Legais" ainda incompleta,
-# por data de inicio (nao depende mais da flag Milestone, pois o usuario pode
-# ter dado duracao real a essas tarefas dentro do Project)
-marcos = df[(df["etapa_num"] == 0) & (~df["is_summary"]) & (df["pct"] < 100) & (df["start"].notna())]
-marcos = marcos.sort_values("start")
+# marco critico: entre as etapas 1 a 6 (0 = so referencia legal, 7 e 8 ainda
+# sem cronograma e nao entram), prioriza a etapa 5 (frente critica sinalizada
+# pela diretoria) e, dentro dela, a data mais proxima; se a etapa 5 nao tiver
+# pendencia com data, cai para a proxima pendencia mais proxima entre 1 e 6.
+tracked_set = set(etapa_df[etapa_df["tem_cronograma"]]["etapa_num"])
+candidatos = df[
+    (df["etapa_num"].between(1, 6))
+    & (df["etapa_num"].isin(tracked_set))
+    & (~df["is_summary"])
+    & (df["pct"] < 100)
+    & (df["start"].notna())
+].copy()
+candidatos["prioridade"] = candidatos["etapa_num"].apply(lambda n: 0 if n == 5 else 1)
+candidatos = candidatos.sort_values(["prioridade", "start"])
+
 marco_txt = "—"
-if len(marcos):
-    m0 = marcos.iloc[0]
+marco_etapa_txt = ""
+if len(candidatos):
+    m0 = candidatos.iloc[0]
     marco_txt = f"{m0['name'].strip()} — {m0['start'].strftime('%d/%m/%Y')}"
+    marco_etapa_txt = f"etapa {int(m0['etapa_num'])}"
 
 c1, c2, c3 = st.columns(3)
 with c1:
@@ -237,16 +271,22 @@ with c1:
         <div style="font-size:0.72rem;opacity:0.75;">exclui etapas sem cronograma definido</div>
         </div>""", unsafe_allow_html=True)
 with c2:
-    spi_txt = "—" if spi is None else f"{spi:.0f}%"
-    spi_color = BLUE if (spi is not None and spi < 90) else NAVY_DARK
+    if spi is None or planned_total < 5:
+        spi_txt = "—"
+        spi_note = "poucas tarefas com previsão vencida ainda para medir"
+        spi_color = MUTED
+    else:
+        spi_txt = f"{spi:.0f}%"
+        spi_note = "real ÷ previsto pela data · abaixo de 100% = atraso frente ao plano"
+        spi_color = BLUE if spi < 90 else NAVY_DARK
     st.markdown(f"""<div class="kpi-card" style="background:{BG_CARD};border:1px solid {BLUE_MID};">
         <div class="kpi-label" style="color:{MUTED};">SPI (ÍNDICE DE PRAZO)</div>
         <div class="kpi-value" style="color:{spi_color};">{spi_txt}</div>
-        <div style="font-size:0.72rem;color:{MUTED};">real ÷ previsto pela data</div>
+        <div style="font-size:0.72rem;color:{MUTED};">{spi_note}</div>
         </div>""", unsafe_allow_html=True)
 with c3:
     st.markdown(f"""<div class="kpi-card" style="background:{BLUE_LIGHT};border:1px solid {BLUE};">
-        <div class="kpi-label" style="color:{NAVY};">MARCO CRÍTICO</div>
+        <div class="kpi-label" style="color:{NAVY};">MARCO CRÍTICO{' · ' + marco_etapa_txt if marco_etapa_txt else ''}</div>
         <div class="kpi-value" style="font-size:1.15rem;color:{NAVY_DARK};">{marco_txt}</div>
         </div>""", unsafe_allow_html=True)
 
@@ -257,25 +297,37 @@ st.write("")
 # ---------------------------------------------------------------------------
 st.subheader("Status por etapa")
 
+etapa_rows_html = []
 for _, row in etapa_df.iterrows():
     n = int(row["etapa_num"])
-    label = f"**{n}. {row['etapa_title']}**"
-    cols = st.columns([3, 6, 1.3])
-    with cols[0]:
-        crit = " 🔴" if "CRITICO" in row["etapa_title"].upper() or "CRÍTICO" in row["etapa_title"].upper() else ""
-        st.markdown(label + crit)
-    with cols[1]:
-        if n == 0:
-            st.progress(0, text="referência (cronograma legal)")
-        elif not row["tem_cronograma"]:
-            st.markdown(f'<span class="pending-tag">aguardando cronograma</span>', unsafe_allow_html=True)
-        else:
-            st.progress(min(int(row["real_pct"]), 100))
-    with cols[2]:
-        if n != 0 and row["tem_cronograma"]:
-            st.markdown(f"**{row['real_pct']:.0f}%**")
-        else:
-            st.markdown("—")
+    title = row["etapa_title"]
+    is_critical_stage = "CRITICO" in title.upper() or "CRÍTICO" in title.upper()
+    crit_dot = f'<span style="color:{BLUE};margin-left:6px;">●</span>' if is_critical_stage else ""
+
+    if n == 0:
+        bar_html = f'''<div style="background:#E7EAF7;border-radius:8px;height:14px;width:100%;position:relative;">
+            <div style="background:{MUTED};opacity:0.35;height:14px;border-radius:8px;width:100%;"></div>
+        </div>'''
+        pct_html = f'<span style="color:{MUTED};font-size:0.85rem;">referência</span>'
+    elif not row["tem_cronograma"]:
+        bar_html = f'''<div style="background:#E7EAF7;border-radius:8px;height:14px;width:100%;"></div>'''
+        pct_html = f'<span class="pending-tag">aguardando cronograma</span>'
+    else:
+        pct = min(row["real_pct"], 100)
+        bar_color = BLUE if is_critical_stage else BLUE_MID
+        bar_html = f'''<div style="background:#E7EAF7;border-radius:8px;height:14px;width:100%;">
+            <div style="background:{bar_color};height:14px;border-radius:8px;width:{pct:.1f}%;"></div>
+        </div>'''
+        pct_html = f'<span style="font-weight:700;color:{NAVY_DARK};">{row["real_pct"]:.0f}%</span>'
+
+    etapa_rows_html.append(f'''
+    <div style="display:grid;grid-template-columns:2.6fr 5fr 1fr;gap:16px;align-items:center;padding:9px 0;border-bottom:1px solid #EEF0FA;">
+        <div style="font-size:0.92rem;color:{NAVY_DARK};"><b>{n}.</b> {title}{crit_dot}</div>
+        <div>{bar_html}</div>
+        <div style="text-align:right;">{pct_html}</div>
+    </div>''')
+
+st.markdown(f'<div style="margin-top:4px;">{"".join(etapa_rows_html)}</div>', unsafe_allow_html=True)
 
 st.write("")
 
@@ -291,11 +343,23 @@ leaves = leaves[leaves["pct"] < 100]
 leaves = leaves.sort_values("start").head(10)
 
 if len(leaves):
-    show = leaves[["start", "etapa_num", "name", "resource", "pct"]].copy()
-    show.columns = ["Data", "Etapa", "Atividade", "Responsável", "% concluído"]
-    show["Data"] = show["Data"].apply(lambda d: d.strftime("%d/%m/%Y") if pd.notna(d) else "a definir")
-    show["Atividade"] = show["Atividade"].str.strip()
-    st.dataframe(show, hide_index=True, use_container_width=True)
+    header_html = f'''<div style="display:grid;grid-template-columns:1.1fr 0.7fr 3.4fr 1.4fr 1fr;
+        background:{NAVY_DARK};color:white;border-radius:8px 8px 0 0;padding:9px 14px;font-size:0.78rem;font-weight:700;letter-spacing:0.3px;">
+        <div>DATA</div><div>ETAPA</div><div>ATIVIDADE</div><div>RESPONSÁVEL</div><div style="text-align:right;">% CONCLUÍDO</div>
+    </div>'''
+    body_rows = []
+    for i, (_, r) in enumerate(leaves.iterrows()):
+        bg = BG_CARD if i % 2 == 0 else "white"
+        data_txt = r["start"].strftime("%d/%m/%Y") if pd.notna(r["start"]) else "a definir"
+        body_rows.append(f'''<div style="display:grid;grid-template-columns:1.1fr 0.7fr 3.4fr 1.4fr 1fr;
+            background:{bg};padding:9px 14px;font-size:0.86rem;border-bottom:1px solid #EEF0FA;align-items:center;">
+            <div style="color:{MUTED};">{data_txt}</div>
+            <div><span class="etapa-badge">{int(r["etapa_num"])}</span></div>
+            <div style="color:{NAVY_DARK};">{r["name"].strip()}</div>
+            <div style="color:{MUTED};">{r["resource"] or "—"}</div>
+            <div style="text-align:right;font-weight:700;color:{NAVY_DARK};">{r["pct"]:.0f}%</div>
+        </div>''')
+    st.markdown(header_html + "".join(body_rows) + '<div style="border-radius:0 0 8px 8px;overflow:hidden;"></div>', unsafe_allow_html=True)
 else:
     st.caption("Nenhuma atividade com cronograma definido no momento.")
 
