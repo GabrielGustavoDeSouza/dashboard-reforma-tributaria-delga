@@ -1,0 +1,5 @@
+streamlit>=1.38
+pandas>=2.0
+plotly>=5.20
+mpxj>=16.7.0
+jpype1>=1.5
