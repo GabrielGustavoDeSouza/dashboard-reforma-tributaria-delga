@@ -4,7 +4,10 @@ Le arquivos MS Project (.mpp) diretamente, calcula KPIs e permite editar
 % concluido, exportando um .xml (MSPDI) que abre nativamente no MS Project.
 """
 import io
+import os
 import re
+import json
+import hashlib
 import tempfile
 import datetime as dt
 
@@ -93,6 +96,59 @@ def read_project(file_bytes: bytes, suffix: str):
     reader = UniversalProjectReader()
     project = reader.read(tmp_path)
     return project
+
+
+@st.cache_resource(show_spinner=False)
+def get_project_cached(file_hash: str, _file_bytes: bytes, suffix: str):
+    """Cache compartilhado por TODAS as sessoes/usuarios (nao e por-sessao),
+    chaveado pelo hash do arquivo. Assim quem abrir o link nao precisa
+    reprocessar nem reenviar nada."""
+    return read_project(_file_bytes, suffix)
+
+
+# ---------------------------------------------------------------------------
+# PERSISTENCIA EM DISCO - o ultimo arquivo enviado fica fixo pra qualquer
+# pessoa que abrir o link, sem precisar reenviar. Enquanto o app do Streamlit
+# Cloud estiver "acordado" isso e permanente; se ele hibernar por inatividade
+# longa ou for reiniciado, o disco volta ao zero e e preciso reenviar 1x.
+# ---------------------------------------------------------------------------
+DATA_DIR = "data"
+META_PATH = os.path.join(DATA_DIR, "meta.json")
+os.makedirs(DATA_DIR, exist_ok=True)
+
+
+def persisted_file_path(suffix: str) -> str:
+    return os.path.join(DATA_DIR, f"current_project{suffix}")
+
+
+def save_persisted(file_bytes: bytes, suffix: str, original_name: str):
+    # remove versao antiga com outra extensao, se existir
+    for ext in (".mpp", ".xml"):
+        p = persisted_file_path(ext)
+        if os.path.exists(p):
+            os.remove(p)
+    with open(persisted_file_path(suffix), "wb") as f:
+        f.write(file_bytes)
+    with open(META_PATH, "w") as f:
+        json.dump({
+            "original_name": original_name,
+            "suffix": suffix,
+            "uploaded_at": dt.datetime.now().isoformat(timespec="minutes"),
+        }, f)
+
+
+def load_persisted():
+    for ext in (".mpp", ".xml"):
+        p = persisted_file_path(ext)
+        if os.path.exists(p):
+            with open(p, "rb") as f:
+                data = f.read()
+            meta = {}
+            if os.path.exists(META_PATH):
+                with open(META_PATH) as f:
+                    meta = json.load(f)
+            return data, ext, meta
+    return None, None, None
 
 
 def java_date_to_py(jdate):
@@ -206,29 +262,44 @@ def build_etapa_summary(df: pd.DataFrame, today: dt.datetime):
 # ---------------------------------------------------------------------------
 # UI - UPLOAD
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# UI - UPLOAD (com persistencia: o arquivo enviado fica valendo pra todo
+# mundo que abrir o link, ate alguem enviar um novo)
+# ---------------------------------------------------------------------------
+persisted_bytes, persisted_suffix, persisted_meta = load_persisted()
+
 with st.sidebar:
     st.markdown("### Arquivo do projeto")
-    uploaded = st.file_uploader("Envie o .mpp (ou .xml exportado do Project)", type=["mpp", "xml"])
-    st.caption("O arquivo é lido diretamente — nenhuma conversão manual necessária.")
+    if persisted_meta:
+        st.success(f"Arquivo atual: **{persisted_meta['original_name']}**\n\nEnviado em {persisted_meta['uploaded_at'].replace('T', ' ')}")
+    uploaded = st.file_uploader(
+        "Enviar novo .mpp (ou .xml exportado do Project)" if persisted_meta else "Envie o .mpp (ou .xml exportado do Project)",
+        type=["mpp", "xml"],
+    )
+    st.caption("O arquivo enviado aqui fica salvo para qualquer pessoa que abrir este link — não precisa reenviar toda vez, só quando quiser atualizar os dados.")
     today_override = st.date_input("Data de referência (\"hoje\")", value=dt.date.today())
     st.divider()
     st.caption("Etapas sem variação de data entre as tarefas são tratadas como **sem cronograma definido** e não entram nos KPIs — assim que você lançar datas reais, elas passam a contar automaticamente.")
 
-if uploaded is None:
+if uploaded is not None:
+    # novo envio: persiste em disco e passa a valer pra todo mundo
+    suffix = ".mpp" if uploaded.name.lower().endswith(".mpp") else ".xml"
+    file_bytes = uploaded.getvalue()
+    save_persisted(file_bytes, suffix, uploaded.name)
+    original_name = uploaded.name
+elif persisted_bytes is not None:
+    # ninguem enviou nada nesta sessao: usa o que ja esta salvo
+    file_bytes = persisted_bytes
+    suffix = persisted_suffix
+    original_name = persisted_meta["original_name"]
+else:
     st.info("Envie o arquivo .mpp na barra lateral para gerar o dashboard.")
     st.stop()
 
-suffix = ".mpp" if uploaded.name.lower().endswith(".mpp") else ".xml"
-file_bytes = uploaded.getvalue()
+file_hash = hashlib.md5(file_bytes).hexdigest()
+with st.spinner("Lendo o arquivo do MS Project..."):
+    project = get_project_cached(file_hash, file_bytes, suffix)
 
-if ("project_obj" not in st.session_state) or (st.session_state.get("last_file_name") != uploaded.name) or (st.session_state.get("last_file_size") != len(file_bytes)):
-    with st.spinner("Lendo o arquivo do MS Project..."):
-        project = read_project(file_bytes, suffix)
-        st.session_state["project_obj"] = project
-        st.session_state["last_file_name"] = uploaded.name
-        st.session_state["last_file_size"] = len(file_bytes)
-
-project = st.session_state["project_obj"]
 df = extract_tasks(project)
 today_dt = dt.datetime.combine(today_override, dt.time(12, 0))
 etapa_df = build_etapa_summary(df, today_dt)
@@ -239,7 +310,9 @@ etapa_df = build_etapa_summary(df, today_dt)
 tracked = etapa_df[(etapa_df["etapa_num"] != 0) & (etapa_df["tem_cronograma"])]
 progresso_total = tracked["real_pct"].mean() if len(tracked) else 0.0
 planned_total = tracked["planned_pct"].mean() if len(tracked) else 0.0
-spi = (progresso_total / planned_total * 100) if planned_total > 0 else None
+# SPI aqui = variacao em pontos percentuais (Real - Previsto), nao a razao classica do EVM.
+# 0 = em dia; negativo = atrasado; positivo = adiantado frente ao cronograma.
+spi = progresso_total - planned_total
 
 # marco critico: entre as etapas 1 a 6 (0 = so referencia legal, 7 e 8 ainda
 # sem cronograma e nao entram), prioriza a etapa 5 (frente critica sinalizada
@@ -271,16 +344,17 @@ with c1:
         <div style="font-size:0.72rem;opacity:0.75;">exclui etapas sem cronograma definido</div>
         </div>""", unsafe_allow_html=True)
 with c2:
-    if spi is None or planned_total < 5:
+    if planned_total < 5:
         spi_txt = "—"
         spi_note = "poucas tarefas com previsão vencida ainda para medir"
         spi_color = MUTED
     else:
-        spi_txt = f"{spi:.0f}%"
-        spi_note = "real ÷ previsto pela data · abaixo de 100% = atraso frente ao plano"
-        spi_color = BLUE if spi < 90 else NAVY_DARK
+        sinal = "+" if spi > 0 else ""
+        spi_txt = f"{sinal}{spi:.0f}%"
+        spi_note = "real − previsto pela data · negativo = atrasado, positivo = adiantado"
+        spi_color = BLUE if spi < 0 else NAVY_DARK
     st.markdown(f"""<div class="kpi-card" style="background:{BG_CARD};border:1px solid {BLUE_MID};">
-        <div class="kpi-label" style="color:{MUTED};">SPI (ÍNDICE DE PRAZO)</div>
+        <div class="kpi-label" style="color:{MUTED};">SPI (VARIAÇÃO DE PRAZO)</div>
         <div class="kpi-value" style="color:{spi_color};">{spi_txt}</div>
         <div style="font-size:0.72rem;color:{MUTED};">{spi_note}</div>
         </div>""", unsafe_allow_html=True)
@@ -397,23 +471,30 @@ if gerar:
     _, UniversalProjectWriter, FileFormat = init_mpxj()
     import jpype
 
+    # importante: usa uma copia independente do projeto pra gerar o .xml,
+    # em vez do objeto "project" (que e compartilhado com todas as sessoes
+    # que estao vendo o dashboard ao vivo). Assim, editar aqui pra exportar
+    # nao muda o que outras pessoas veem ate voce de fato reenviar o arquivo
+    # atualizado na barra lateral.
+    edit_project = read_project(file_bytes, suffix)
+
     changed = 0
     for idx, (uid, new_pct) in enumerate(zip(editable["unique_id"], edited["% concluído"])):
         old_pct = editable["pct"].iloc[idx]
         if new_pct != old_pct:
-            task = project.getTaskByUniqueID(jpype.java.lang.Integer(int(uid)))
+            task = edit_project.getTaskByUniqueID(jpype.java.lang.Integer(int(uid)))
             if task is not None:
                 task.setPercentageComplete(jpype.java.lang.Double(float(new_pct)))
                 changed += 1
 
     out_path = tempfile.NamedTemporaryFile(delete=False, suffix=".xml").name
     writer = UniversalProjectWriter(FileFormat.MSPDI)
-    writer.write(project, out_path)
+    writer.write(edit_project, out_path)
 
     with open(out_path, "rb") as f:
         xml_bytes = f.read()
 
-    st.success(f"{changed} tarefa(s) atualizada(s). Baixe o arquivo abaixo e abra direto no MS Project (Arquivo → Abrir).")
+    st.success(f"{changed} tarefa(s) atualizada(s). Baixe o arquivo abaixo, confira no MS Project e, quando quiser que o dashboard de todo mundo reflita essa versão, reenvie esse mesmo .xml na barra lateral.")
     st.download_button(
         "Baixar .xml atualizado",
         data=xml_bytes,
