@@ -236,10 +236,26 @@ def compute_planned_pct(row, today):
     return max(0.0, min(100.0, elapsed / total * 100.0))
 
 
-def build_etapa_summary(df: pd.DataFrame, today: dt.datetime):
+TOLERANCIA_PP = 2.0  # pontos percentuais de tolerancia pro farol
+
+
+def classify_status(diff: float):
+    """diff = real_pct - planned_pct. Retorna (rotulo, cor)."""
+    if diff < -TOLERANCIA_PP:
+        return "atrasado", "#D64545"
+    if diff > TOLERANCIA_PP:
+        return "adiantado", BLUE
+    return "em andamento", "#1B8A5A"
+
+
+def build_leaves(df: pd.DataFrame, today: dt.datetime) -> pd.DataFrame:
     leaves = df[~df["is_summary"]].copy()
     leaves["planned_pct"] = leaves.apply(lambda r: compute_planned_pct(r, today), axis=1)
+    leaves["diff_pp"] = leaves["pct"] - leaves["planned_pct"]
+    return leaves
 
+
+def build_etapa_summary(leaves: pd.DataFrame):
     etapas = []
     for num, g in leaves.groupby("etapa_num"):
         title = g["etapa_title"].iloc[0]
@@ -247,21 +263,23 @@ def build_etapa_summary(df: pd.DataFrame, today: dt.datetime):
         tem_cronograma = unique_starts > 1
         real_pct = g["pct"].mean() if len(g) else 0.0
         planned_pct = g["planned_pct"].mean() if len(g) else 0.0
+        diff_pp = real_pct - planned_pct
+        status_label, status_color = classify_status(diff_pp)
         etapas.append({
             "etapa_num": num,
             "etapa_title": title,
             "tem_cronograma": tem_cronograma,
             "real_pct": real_pct,
             "planned_pct": planned_pct,
+            "diff_pp": diff_pp,
+            "status_label": status_label,
+            "status_color": status_color,
             "n_tasks": len(g),
             "n_done": int((g["pct"] >= 100).sum()),
         })
     return pd.DataFrame(etapas).sort_values("etapa_num")
 
 
-# ---------------------------------------------------------------------------
-# UI - UPLOAD
-# ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
 # UI - UPLOAD (com persistencia: o arquivo enviado fica valendo pra todo
 # mundo que abrir o link, ate alguem enviar um novo)
@@ -302,7 +320,8 @@ with st.spinner("Lendo o arquivo do MS Project..."):
 
 df = extract_tasks(project)
 today_dt = dt.datetime.combine(today_override, dt.time(12, 0))
-etapa_df = build_etapa_summary(df, today_dt)
+leaves_df = build_leaves(df, today_dt)
+etapa_df = build_etapa_summary(leaves_df)
 
 # ---------------------------------------------------------------------------
 # KPIs
@@ -367,6 +386,47 @@ with c3:
 st.write("")
 
 # ---------------------------------------------------------------------------
+# ATIVIDADES EM ATRASO (farol: fora da tolerancia de +-2pp, real < previsto)
+# ---------------------------------------------------------------------------
+tracked_set_top = set(etapa_df[etapa_df["tem_cronograma"]]["etapa_num"])
+atrasadas = leaves_df[
+    (leaves_df["etapa_num"] != 0)
+    & (leaves_df["etapa_num"].isin(tracked_set_top))
+    & (leaves_df["diff_pp"] < -TOLERANCIA_PP)
+].copy()
+atrasadas = atrasadas.sort_values("diff_pp")
+
+if len(atrasadas):
+    st.subheader(f"🔴 Atividades em atraso ({len(atrasadas)})")
+    st.caption(f"Real abaixo do previsto em mais de {TOLERANCIA_PP:.0f} pontos percentuais.")
+    rows_html = []
+    for _, r in atrasadas.head(15).iterrows():
+        real = min(max(r["pct"], 0), 100)
+        planned = min(max(r["planned_pct"], 0), 100)
+        data_txt = r["start"].strftime("%d/%m/%Y") if pd.notna(r["start"]) else "a definir"
+        rows_html.append(f'''
+        <div style="display:grid;grid-template-columns:1fr 0.6fr 3fr 4fr 1fr;gap:14px;align-items:center;
+            padding:8px 0;border-bottom:1px solid #EEF0FA;">
+            <div style="font-size:0.82rem;color:{MUTED};">{data_txt}</div>
+            <div><span class="etapa-badge">{int(r["etapa_num"])}</span></div>
+            <div style="font-size:0.88rem;color:{NAVY_DARK};">{r["name"].strip()}</div>
+            <div style="position:relative;background:#F3D8D8;border-radius:8px;height:14px;">
+                <div style="position:absolute;left:0;top:0;background:#E7EAF7;height:14px;border-radius:8px;width:{planned:.1f}%;border-right:2px solid {MUTED};"></div>
+                <div style="position:absolute;left:0;top:0;background:#D64545;height:14px;border-radius:8px;width:{real:.1f}%;"></div>
+            </div>
+            <div style="text-align:right;font-size:0.82rem;">
+                <span style="font-weight:700;color:#D64545;">{r["pct"]:.0f}%</span>
+                <span style="color:{MUTED};"> / {r["planned_pct"]:.0f}%</span>
+            </div>
+        </div>''')
+    st.markdown("".join(rows_html), unsafe_allow_html=True)
+    st.caption("Barra vermelha = real · marcador cinza = onde deveria estar pelo cronograma.")
+else:
+    st.success(f"Nenhuma atividade fora da tolerância de ±{TOLERANCIA_PP:.0f}pp em relação ao previsto.")
+
+st.write("")
+
+# ---------------------------------------------------------------------------
 # STATUS POR ETAPA
 # ---------------------------------------------------------------------------
 st.subheader("Status por etapa")
@@ -383,9 +443,11 @@ for _, row in etapa_df.iterrows():
             <div style="background:{MUTED};opacity:0.35;height:14px;border-radius:8px;width:100%;"></div>
         </div>'''
         pct_html = f'<span style="color:{MUTED};font-size:0.85rem;">referência</span>'
+        farol_html = ""
     elif not row["tem_cronograma"]:
         bar_html = f'''<div style="background:#E7EAF7;border-radius:8px;height:14px;width:100%;"></div>'''
         pct_html = f'<span class="pending-tag">aguardando cronograma</span>'
+        farol_html = ""
     else:
         pct = min(row["real_pct"], 100)
         bar_color = BLUE if is_critical_stage else BLUE_MID
@@ -393,15 +455,18 @@ for _, row in etapa_df.iterrows():
             <div style="background:{bar_color};height:14px;border-radius:8px;width:{pct:.1f}%;"></div>
         </div>'''
         pct_html = f'<span style="font-weight:700;color:{NAVY_DARK};">{row["real_pct"]:.0f}%</span>'
+        farol_html = f'''<span title="{row['status_label']}" style="display:inline-block;width:9px;height:9px;
+            border-radius:50%;background:{row['status_color']};margin-right:8px;"></span>'''
 
     etapa_rows_html.append(f'''
     <div style="display:grid;grid-template-columns:2.6fr 5fr 1fr;gap:16px;align-items:center;padding:9px 0;border-bottom:1px solid #EEF0FA;">
-        <div style="font-size:0.92rem;color:{NAVY_DARK};"><b>{n}.</b> {title}{crit_dot}</div>
+        <div style="font-size:0.92rem;color:{NAVY_DARK};">{farol_html}<b>{n}.</b> {title}{crit_dot}</div>
         <div>{bar_html}</div>
         <div style="text-align:right;">{pct_html}</div>
     </div>''')
 
 st.markdown(f'<div style="margin-top:4px;">{"".join(etapa_rows_html)}</div>', unsafe_allow_html=True)
+st.caption(f"🟢 em andamento (±{TOLERANCIA_PP:.0f}pp)  ·  🔴 atrasado  ·  🔵 adiantado")
 
 st.write("")
 
