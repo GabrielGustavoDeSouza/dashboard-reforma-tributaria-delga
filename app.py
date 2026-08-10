@@ -367,13 +367,17 @@ with c2:
         spi_txt = "—"
         spi_note = "poucas tarefas com previsão vencida ainda para medir"
         spi_color = MUTED
+        farol_dot = ""
     else:
         sinal = "+" if spi > 0 else ""
         spi_txt = f"{sinal}{spi:.0f}%"
         spi_note = "real − previsto pela data · negativo = atrasado, positivo = adiantado"
+        spi_label, spi_dot_color = classify_status(spi)
         spi_color = BLUE if spi < 0 else NAVY_DARK
+        farol_dot = f'''<span title="{spi_label}" style="display:inline-block;width:10px;height:10px;
+            border-radius:50%;background:{spi_dot_color};margin-right:8px;vertical-align:middle;"></span>'''
     st.markdown(f"""<div class="kpi-card" style="background:{BG_CARD};border:1px solid {BLUE_MID};">
-        <div class="kpi-label" style="color:{MUTED};">SPI (VARIAÇÃO DE PRAZO)</div>
+        <div class="kpi-label" style="color:{MUTED};">{farol_dot}SPI (VARIAÇÃO DE PRAZO)</div>
         <div class="kpi-value" style="color:{spi_color};">{spi_txt}</div>
         <div style="font-size:0.72rem;color:{MUTED};">{spi_note}</div>
         </div>""", unsafe_allow_html=True)
@@ -386,41 +390,48 @@ with c3:
 st.write("")
 
 # ---------------------------------------------------------------------------
-# ATIVIDADES EM ATRASO (farol: fora da tolerancia de +-2pp, real < previsto)
+# ATIVIDADES EM ATRASO
+# Estritamente: tarefas cuja data de TERMINO ja passou e que nao estao 100%
+# concluidas. O farol de +-2pp e so pro indicador geral (SPI / status por
+# etapa) - aqui e "venceu o prazo e nao terminou", ponto, sem tolerancia de
+# ritmo intermediario.
 # ---------------------------------------------------------------------------
 tracked_set_top = set(etapa_df[etapa_df["tem_cronograma"]]["etapa_num"])
 atrasadas = leaves_df[
     (leaves_df["etapa_num"] != 0)
     & (leaves_df["etapa_num"].isin(tracked_set_top))
-    & (leaves_df["diff_pp"] < -TOLERANCIA_PP)
+    & (leaves_df["finish"].notna())
+    & (leaves_df["finish"] <= today_dt)
+    & (leaves_df["pct"] < 100)
 ].copy()
-atrasadas = atrasadas.sort_values("diff_pp")
+atrasadas["dias_atraso"] = (today_dt - atrasadas["finish"]).dt.days
+atrasadas = atrasadas.sort_values("dias_atraso", ascending=False)
 
 if len(atrasadas):
     st.subheader(f"🔴 Atividades em atraso ({len(atrasadas)})")
-    st.caption(f"Real abaixo do previsto em mais de {TOLERANCIA_PP:.0f} pontos percentuais.")
+    st.caption("Prazo de término já vencido e ainda não concluídas — não é ritmo, é prazo estourado.")
     rows_html = []
     for _, r in atrasadas.head(15).iterrows():
         real = min(max(r["pct"], 0), 100)
         planned = min(max(r["planned_pct"], 0), 100)
-        data_txt = r["start"].strftime("%d/%m/%Y") if pd.notna(r["start"]) else "a definir"
+        venc_txt = r["finish"].strftime("%d/%m/%Y") if pd.notna(r["finish"]) else "—"
+        dias = int(r["dias_atraso"])
         rows_html.append(f'''
-        <div style="display:grid;grid-template-columns:1fr 0.6fr 3fr 4fr 1fr;gap:14px;align-items:center;
+        <div style="display:grid;grid-template-columns:1.1fr 0.6fr 3fr 3.4fr 1.3fr;gap:14px;align-items:center;
             padding:8px 0;border-bottom:1px solid #EEF0FA;">
-            <div style="font-size:0.82rem;color:{MUTED};">{data_txt}</div>
+            <div style="font-size:0.82rem;color:#D64545;">venceu {venc_txt}<br><span style="font-size:0.72rem;">({dias}d atrás)</span></div>
             <div><span class="etapa-badge">{int(r["etapa_num"])}</span></div>
             <div style="font-size:0.88rem;color:{NAVY_DARK};">{r["name"].strip()}</div>
             <div style="position:relative;background:#F3D8D8;border-radius:8px;height:14px;">
-                <div style="position:absolute;left:0;top:0;background:#E7EAF7;height:14px;border-radius:8px;width:{planned:.1f}%;border-right:2px solid {MUTED};"></div>
                 <div style="position:absolute;left:0;top:0;background:#D64545;height:14px;border-radius:8px;width:{real:.1f}%;"></div>
             </div>
             <div style="text-align:right;font-size:0.82rem;">
                 <span style="font-weight:700;color:#D64545;">{r["pct"]:.0f}%</span>
-                <span style="color:{MUTED};"> / {r["planned_pct"]:.0f}%</span>
+                <span style="color:{MUTED};"> concluído</span>
             </div>
         </div>''')
     st.markdown("".join(rows_html), unsafe_allow_html=True)
-    st.caption("Barra vermelha = real · marcador cinza = onde deveria estar pelo cronograma.")
+    st.caption("Ordenado pelas mais atrasadas primeiro (dias corridos desde o vencimento).")
 else:
     st.success(f"Nenhuma atividade fora da tolerância de ±{TOLERANCIA_PP:.0f}pp em relação ao previsto.")
 
